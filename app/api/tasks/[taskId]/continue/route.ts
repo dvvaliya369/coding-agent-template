@@ -19,6 +19,12 @@ import { getMaxSandboxDuration } from '@/lib/db/settings'
 import { generateCommitMessage, createFallbackCommitMessage } from '@/lib/utils/commit-message-generator'
 import { detectPortFromRepo } from '@/lib/sandbox/port-detection'
 
+// Shared sandbox reference for cleanup on process termination.
+// When the Vercel serverless function is killed (e.g., at the 5-minute maxDuration limit),
+// the sandbox VM would otherwise keep running until its own timeout expires, wasting resources.
+let activeContinueSandboxRef: Sandbox | null = null
+let activeContinueKeepAlive = false
+
 export async function POST(req: NextRequest, context: { params: Promise<{ taskId: string }> }) {
   try {
     const session = await getServerSession()
@@ -91,9 +97,9 @@ export async function POST(req: NextRequest, context: { params: Promise<{ taskId
     // Get max sandbox duration for this user (user-specific > global > env var)
     const maxSandboxDuration = await getMaxSandboxDuration(session.user.id)
 
-    // Process the continuation asynchronously
+    // Process the continuation asynchronously with timeout and cleanup
     after(async () => {
-      await continueTask(
+      await continueTaskWithTimeout(
         taskId,
         message.trim(),
         task.repoUrl || '',
@@ -102,6 +108,7 @@ export async function POST(req: NextRequest, context: { params: Promise<{ taskId
         task.selectedAgent || 'claude',
         task.selectedModel || undefined,
         task.installDependencies || false,
+        task.keepAlive || false,
         userApiKeys,
         userGithubToken,
         githubUser,
@@ -112,6 +119,130 @@ export async function POST(req: NextRequest, context: { params: Promise<{ taskId
   } catch (error) {
     console.error('Error continuing task:', error)
     return NextResponse.json({ error: 'Failed to continue task' }, { status: 500 })
+  }
+}
+
+// Register cleanup handler for process termination signals.
+// This ensures the sandbox is stopped when the serverless function is killed
+// before the task's own timeout fires (e.g., 5-min function limit vs 30-min sandbox).
+function registerContinueProcessCleanupHandler(taskId: string) {
+  const cleanup = async () => {
+    if (activeContinueSandboxRef && !activeContinueKeepAlive) {
+      console.log(`Process terminating - stopping sandbox for continue task ${taskId}`)
+      try {
+        unregisterSandbox(taskId)
+        await shutdownSandbox(activeContinueSandboxRef)
+      } catch (error) {
+        console.error('Failed to stop sandbox during process cleanup:', error)
+      } finally {
+        activeContinueSandboxRef = null
+      }
+    }
+  }
+
+  process.once('SIGTERM', () => {
+    cleanup().catch(console.error)
+  })
+  process.once('SIGINT', () => {
+    cleanup().catch(console.error)
+  })
+  process.once('beforeExit', () => {
+    cleanup().catch(console.error)
+  })
+}
+
+async function continueTaskWithTimeout(
+  taskId: string,
+  prompt: string,
+  repoUrl: string,
+  branchName: string,
+  maxDuration: number,
+  selectedAgent: string = 'claude',
+  selectedModel?: string,
+  installDependencies: boolean = false,
+  keepAlive: boolean = false,
+  apiKeys?: {
+    OPENAI_API_KEY?: string
+    GEMINI_API_KEY?: string
+    CURSOR_API_KEY?: string
+    ANTHROPIC_API_KEY?: string
+    AI_GATEWAY_API_KEY?: string
+  },
+  githubToken?: string | null,
+  githubUser?: {
+    username: string
+    name: string | null
+    email: string | null
+  } | null,
+) {
+  const TASK_TIMEOUT_MS = maxDuration * 60 * 1000
+
+  // Track keepAlive for the cleanup handler
+  activeContinueKeepAlive = keepAlive
+
+  // Register process-level cleanup to handle serverless function termination
+  registerContinueProcessCleanupHandler(taskId)
+
+  const warningTimeMs = Math.max(TASK_TIMEOUT_MS - 60 * 1000, 0)
+  const warningTimeout = setTimeout(async () => {
+    try {
+      const warningLogger = createTaskLogger(taskId)
+      await warningLogger.info('Task is approaching timeout, will complete soon')
+    } catch (error) {
+      console.error('Failed to add timeout warning:', error)
+    }
+  }, warningTimeMs)
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(new Error(`Task continuation timed out after ${maxDuration} minutes`))
+    }, TASK_TIMEOUT_MS)
+  })
+
+  try {
+    await Promise.race([
+      continueTask(
+        taskId,
+        prompt,
+        repoUrl,
+        branchName,
+        maxDuration,
+        selectedAgent,
+        selectedModel,
+        installDependencies,
+        apiKeys,
+        githubToken,
+        githubUser,
+      ),
+      timeoutPromise,
+    ])
+
+    clearTimeout(warningTimeout)
+  } catch (error: unknown) {
+    clearTimeout(warningTimeout)
+
+    if (error instanceof Error && error.message?.includes('timed out after')) {
+      console.error('Continue task timed out:', taskId)
+
+      // Stop the sandbox on timeout to prevent it from running idle
+      if (activeContinueSandboxRef && !keepAlive) {
+        try {
+          console.log(`Continue task timed out - stopping sandbox for task ${taskId}`)
+          unregisterSandbox(taskId)
+          await shutdownSandbox(activeContinueSandboxRef)
+        } catch (shutdownError) {
+          console.error('Failed to stop sandbox after timeout:', shutdownError)
+        } finally {
+          activeContinueSandboxRef = null
+        }
+      }
+
+      const timeoutLogger = createTaskLogger(taskId)
+      await timeoutLogger.error('Task continuation timed out')
+      await timeoutLogger.updateStatus('error', 'Task continuation timed out. The operation took too long to complete.')
+    } else {
+      throw error
+    }
   }
 }
 
@@ -180,6 +311,8 @@ async function continueTask(
         if (reconnectedSandbox) {
           await logger.info('Successfully reconnected to existing sandbox')
           sandbox = reconnectedSandbox
+          // Store sandbox reference for process-level cleanup handlers
+          activeContinueSandboxRef = sandbox
           isResumedSandbox = true // Mark as resumed
           await logger.updateProgress(50, 'Executing agent with follow-up message')
         }
@@ -231,6 +364,8 @@ async function continueTask(
 
       const { sandbox: createdSandbox, domain } = sandboxResult
       sandbox = createdSandbox || null
+      // Store sandbox reference for process-level cleanup handlers
+      activeContinueSandboxRef = sandbox
 
       await db
         .update(tasks)
@@ -406,6 +541,8 @@ async function continueTask(
         // Shutdown sandbox
         unregisterSandbox(taskId)
         const shutdownResult = await shutdownSandbox(sandbox)
+        // Clear shared ref so process cleanup handler doesn't double-stop
+        activeContinueSandboxRef = null
         if (shutdownResult.success) {
           await logger.success('Sandbox shutdown completed')
         } else {
@@ -450,6 +587,8 @@ async function continueTask(
         } else {
           unregisterSandbox(taskId)
           await shutdownSandbox(sandbox)
+          // Clear shared ref so process cleanup handler doesn't double-stop
+          activeContinueSandboxRef = null
         }
       }
     } catch (cleanupError) {

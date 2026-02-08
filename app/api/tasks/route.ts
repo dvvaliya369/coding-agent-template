@@ -249,6 +249,46 @@ export async function POST(request: NextRequest) {
   }
 }
 
+// Shared sandbox reference for cleanup on process termination.
+// When the Vercel serverless function is killed (e.g., at the 5-minute maxDuration limit),
+// the sandbox VM would otherwise keep running until its own timeout expires, wasting resources.
+let activeSandboxRef: Sandbox | null = null
+let activeTaskKeepAlive = false
+
+// Register cleanup handler for process termination signals.
+// This ensures the sandbox is stopped when the serverless function is killed
+// before the task's own timeout fires (e.g., 5-min function limit vs 30-min sandbox).
+function registerProcessCleanupHandler(taskId: string) {
+  const cleanup = async () => {
+    if (activeSandboxRef && !activeTaskKeepAlive) {
+      console.log(`Process terminating - stopping sandbox for task ${taskId}`)
+      try {
+        unregisterSandbox(taskId)
+        await shutdownSandbox(activeSandboxRef)
+      } catch (error) {
+        console.error('Failed to stop sandbox during process cleanup:', error)
+      } finally {
+        activeSandboxRef = null
+      }
+    }
+  }
+
+  // SIGTERM is sent by Vercel when the serverless function reaches its maxDuration
+  process.once('SIGTERM', () => {
+    cleanup().catch(console.error)
+  })
+
+  // SIGINT for local development
+  process.once('SIGINT', () => {
+    cleanup().catch(console.error)
+  })
+
+  // beforeExit fires when the Node.js event loop is empty and has nothing to schedule
+  process.once('beforeExit', () => {
+    cleanup().catch(console.error)
+  })
+}
+
 async function processTaskWithTimeout(
   taskId: string,
   prompt: string,
@@ -274,6 +314,12 @@ async function processTaskWithTimeout(
   } | null,
 ) {
   const TASK_TIMEOUT_MS = maxDuration * 60 * 1000 // Convert minutes to milliseconds
+
+  // Track keepAlive for the cleanup handler
+  activeTaskKeepAlive = keepAlive
+
+  // Register process-level cleanup to handle serverless function termination
+  registerProcessCleanupHandler(taskId)
 
   // Add a warning 1 minute before timeout
   const warningTimeMs = Math.max(TASK_TIMEOUT_MS - 60 * 1000, 0)
@@ -319,6 +365,19 @@ async function processTaskWithTimeout(
     // Handle timeout specifically
     if (error instanceof Error && error.message?.includes('timed out after')) {
       console.error('Task timed out:', taskId)
+
+      // Stop the sandbox on timeout to prevent it from running idle
+      if (activeSandboxRef && !keepAlive) {
+        try {
+          console.log(`Task timed out - stopping sandbox for task ${taskId}`)
+          unregisterSandbox(taskId)
+          await shutdownSandbox(activeSandboxRef)
+        } catch (shutdownError) {
+          console.error('Failed to stop sandbox after timeout:', shutdownError)
+        } finally {
+          activeSandboxRef = null
+        }
+      }
 
       // Use logger for timeout error
       const timeoutLogger = createTaskLogger(taskId)
@@ -501,6 +560,8 @@ async function processTask(
 
     const { sandbox: createdSandbox, domain, branchName } = sandboxResult
     sandbox = createdSandbox || null
+    // Store sandbox reference for process-level cleanup handlers
+    activeSandboxRef = sandbox
     console.log('Sandbox created successfully')
 
     // Update sandbox URL, sandbox ID, and branch name (only update branch name if not already set by AI)
@@ -675,6 +736,8 @@ async function processTask(
         // Unregister and shutdown sandbox
         unregisterSandbox(taskId)
         const shutdownResult = await shutdownSandbox(sandbox!)
+        // Clear shared ref so process cleanup handler doesn't double-stop
+        activeSandboxRef = null
         if (shutdownResult.success) {
           await logger.success('Sandbox shutdown completed')
         } else {
@@ -715,6 +778,8 @@ async function processTask(
         } else {
           unregisterSandbox(taskId)
           const shutdownResult = await shutdownSandbox(sandbox)
+          // Clear shared ref so process cleanup handler doesn't double-stop
+          activeSandboxRef = null
           if (shutdownResult.success) {
             await logger.info('Sandbox shutdown completed after error')
           } else {
