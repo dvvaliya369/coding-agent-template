@@ -324,6 +324,27 @@ async function processTaskWithTimeout(
       const timeoutLogger = createTaskLogger(taskId)
       await timeoutLogger.error('Task execution timed out')
       await timeoutLogger.updateStatus('error', 'Task execution timed out. The operation took too long to complete.')
+
+      // Cleanup sandbox on timeout if keepAlive is false
+      if (!keepAlive) {
+        try {
+          const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1)
+          if (task?.sandboxId) {
+            const sandbox = await Sandbox.get({
+              sandboxId: task.sandboxId,
+              teamId: process.env.SANDBOX_VERCEL_TEAM_ID!,
+              projectId: process.env.SANDBOX_VERCEL_PROJECT_ID!,
+              token: process.env.SANDBOX_VERCEL_TOKEN!,
+            })
+            unregisterSandbox(taskId)
+            await shutdownSandbox(sandbox)
+            await timeoutLogger.info('Sandbox terminated due to agent timeout')
+          }
+        } catch (cleanupError) {
+          console.error('Failed to cleanup sandbox after timeout:', cleanupError)
+          await timeoutLogger.error('Failed to cleanup sandbox after timeout')
+        }
+      }
     } else {
       // Re-throw other errors to be handled by the original error handler
       throw error
