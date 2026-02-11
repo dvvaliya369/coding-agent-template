@@ -475,18 +475,19 @@ EOF`
       await logger.info('Cursor command started with output capture, monitoring for completion...')
     }
 
-    // Wait for completion - let sandbox timeout handle the hard limit
-    let attempts = 0
+    // Wait for completion with timeout matching sandbox duration
+    // The sandbox.runCommand with detached:true runs asynchronously,
+    // so we need to actively poll for completion status
+    const startTime = Date.now()
+    const maxWaitTime = 10 * 60 * 60 * 1000 // 10 hours in milliseconds (extremely generous to allow for long-running tasks)
 
     while (!isCompleted) {
       await new Promise((resolve) => setTimeout(resolve, 1000)) // Wait 1 second
-      attempts++
 
-      // Safety check: if we've been waiting over 4 minutes, break and check git status
-      // (sandbox timeout is 5 minutes, so we leave a buffer)
-      if (attempts > 240) {
+      const elapsed = Date.now() - startTime
+      if (elapsed > maxWaitTime) {
         if (logger) {
-          await logger.info('Approaching sandbox timeout, checking for changes...')
+          await logger.info('Agent process reached maximum wait time')
         }
         break
       }

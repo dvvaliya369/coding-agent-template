@@ -424,9 +424,20 @@ export async function executeClaudeInSandbox(
 
     await logger.info('Claude command started with output capture, monitoring for completion...')
 
-    // Wait for completion - let sandbox timeout handle the hard limit
+    // Wait for completion with timeout matching sandbox duration
+    // The sandbox.runCommand with detached:true runs asynchronously,
+    // so we need to actively poll for completion status
+    const startTime = Date.now()
+    const maxWaitTime = 10 * 60 * 60 * 1000 // 10 hours in milliseconds (extremely generous to allow for long-running tasks)
+
     while (!isCompleted) {
       await new Promise((resolve) => setTimeout(resolve, 1000)) // Wait 1 second
+
+      const elapsed = Date.now() - startTime
+      if (elapsed > maxWaitTime) {
+        await logger.info('Agent process reached maximum wait time')
+        break
+      }
     }
 
     await logger.info('Claude completed successfully')
