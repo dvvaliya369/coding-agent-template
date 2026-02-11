@@ -55,6 +55,7 @@ export async function executeCursorInSandbox(
   isResumed?: boolean,
   sessionId?: string,
   taskId?: string,
+  maxDurationMinutes?: number,
 ): Promise<AgentExecutionResult> {
   try {
     // Executing Cursor CLI with instruction
@@ -475,31 +476,34 @@ EOF`
       await logger.info('Cursor command started with output capture, monitoring for completion...')
     }
 
-    // Wait for completion - let sandbox timeout handle the hard limit
-    let attempts = 0
+    // Wait for completion with timeout protection
+    // Use maxDurationMinutes if provided, otherwise default to 25 minutes (leaving buffer for cleanup)
+    const MAX_AGENT_WAIT_MS = (maxDurationMinutes || 25) * 60 * 1000
+    const agentStartTime = Date.now()
+    let lastLogTime = Date.now()
 
     while (!isCompleted) {
-      await new Promise((resolve) => setTimeout(resolve, 1000)) // Wait 1 second
-      attempts++
+      const elapsedMs = Date.now() - agentStartTime
 
-      // Safety check: if we've been waiting over 4 minutes, break and check git status
-      // (sandbox timeout is 5 minutes, so we leave a buffer)
-      if (attempts > 240) {
-        if (logger) {
-          await logger.info('Approaching sandbox timeout, checking for changes...')
-        }
-        break
+      // Check if we've exceeded the maximum wait time
+      if (elapsedMs > MAX_AGENT_WAIT_MS) {
+        await logger.error(`Agent execution timed out after ${Math.floor(elapsedMs / 60000)} minutes`)
+        throw new Error(
+          `Agent execution timed out. The agent did not complete within the allocated time of ${maxDurationMinutes || 25} minutes.`,
+        )
       }
+
+      // Log progress every 30 seconds to show we're still alive
+      if (Date.now() - lastLogTime > 30000) {
+        await logger.info(`Agent still running... (${Math.floor(elapsedMs / 60000)} minutes elapsed)`)
+        lastLogTime = Date.now()
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 1000)) // Wait 1 second
     }
 
-    if (isCompleted) {
-      if (logger) {
-        await logger.info('Cursor completed successfully')
-      }
-    } else {
-      if (logger) {
-        await logger.info('Cursor execution ended, checking for changes')
-      }
+    if (logger) {
+      await logger.info('Cursor completed successfully')
     }
 
     const result = {

@@ -34,6 +34,7 @@ export async function executeAgentInSandbox(
   sessionId?: string,
   taskId?: string,
   agentMessageId?: string,
+  maxDurationMinutes?: number,
 ): Promise<AgentExecutionResult> {
   // Check for cancellation before starting agent execution
   if (onCancellationCheck && (await onCancellationCheck())) {
@@ -87,6 +88,7 @@ export async function executeAgentInSandbox(
           sessionId,
           taskId,
           agentMessageId,
+          maxDurationMinutes,
         )
 
       case 'codex':
@@ -122,6 +124,7 @@ export async function executeAgentInSandbox(
           isResumed,
           sessionId,
           taskId,
+          maxDurationMinutes,
         )
 
       case 'gemini':

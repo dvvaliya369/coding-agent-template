@@ -334,6 +334,7 @@ async function continueTask(
       currentTask.agentSessionId || undefined, // Pass agent session ID for resumption
       taskId, // taskId for streaming updates
       agentMessageId, // agentMessageId for streaming updates
+      maxDuration, // maxDurationMinutes - pass the configured sandbox duration
     )
 
     console.log('Agent execution completed')

@@ -195,6 +195,7 @@ export async function executeClaudeInSandbox(
   sessionId?: string,
   taskId?: string,
   agentMessageId?: string,
+  maxDurationMinutes?: number,
 ): Promise<AgentExecutionResult> {
   let extractedSessionId: string | undefined
   try {
@@ -424,8 +425,29 @@ export async function executeClaudeInSandbox(
 
     await logger.info('Claude command started with output capture, monitoring for completion...')
 
-    // Wait for completion - let sandbox timeout handle the hard limit
+    // Wait for completion with timeout protection
+    // Use maxDurationMinutes if provided, otherwise default to 25 minutes (leaving buffer for cleanup)
+    const MAX_AGENT_WAIT_MS = (maxDurationMinutes || 25) * 60 * 1000
+    const agentStartTime = Date.now()
+    let lastLogTime = Date.now()
+
     while (!isCompleted) {
+      const elapsedMs = Date.now() - agentStartTime
+
+      // Check if we've exceeded the maximum wait time
+      if (elapsedMs > MAX_AGENT_WAIT_MS) {
+        await logger.error(`Agent execution timed out after ${Math.floor(elapsedMs / 60000)} minutes`)
+        throw new Error(
+          `Agent execution timed out. The agent did not complete within the allocated time of ${maxDurationMinutes || 25} minutes.`,
+        )
+      }
+
+      // Log progress every 30 seconds to show we're still alive
+      if (Date.now() - lastLogTime > 30000) {
+        await logger.info(`Agent still running... (${Math.floor(elapsedMs / 60000)} minutes elapsed)`)
+        lastLogTime = Date.now()
+      }
+
       await new Promise((resolve) => setTimeout(resolve, 1000)) // Wait 1 second
     }
 

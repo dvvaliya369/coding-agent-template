@@ -600,6 +600,7 @@ async function processTask(
       undefined, // sessionId
       taskId, // taskId for streaming updates
       agentMessageId, // agentMessageId for streaming updates
+      maxDuration, // maxDurationMinutes - pass the configured sandbox duration
     )
 
     console.log('Agent execution completed')
